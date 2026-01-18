@@ -1,0 +1,313 @@
+var land = ee.ImageCollection('LANDSAT/LC08/C02/T1_TOA')
+        .filterBounds(point)
+        .filterDate('2019-07-01' , '2019-12-31')
+        .sort('CLOUDY_PIXEL_PERCENTAGE')
+        .first()
+        .clip(roi)
+        .select(['B1', 'B3', 'B4', 'B5'])
+        .rename(['BlueC', 'Green', 'Red', 'NIR'])
+        
+print(land)
+
+//Parâmetros de visualização
+var visParams = {bands:['Red', 'Green', 'BlueC'], min: 0, max: 0.2, gamma: 0.8};
+
+Map.addLayer(land, visParams, '1. SR (Antes do Deglint)');
+
+//Regressão entre NIR e banda do visível (exemplo)
+//var linearFit = land.select(['NIR', 'BlueC']).reduceRegion({
+  //      reducer: ee.Reducer.linearFit(),
+    //    geometry: glint,
+      //  scale: 10
+//});
+
+//print('Regression NIR-BlueC', linearFit)
+//print('Slope', linearFit.get('scale'))
+
+//Função deglint
+function deglint(img){
+  //Regressão fit para NIR e cada banda do visível
+  var linearFitBC = img.select(['NIR' , 'BlueC']).reduceRegion({
+      reducer: ee.Reducer.linearFit(),
+      geometry: glint,
+      scale: 10
+  });
+  var linearFitG = img.select(['NIR' , 'Green']).reduceRegion({
+      reducer: ee.Reducer.linearFit(),
+      geometry: glint,
+      scale: 10
+  });
+  var linearFitR = img.select(['NIR' , 'Red']).reduceRegion({
+      reducer: ee.Reducer.linearFit(),
+      geometry: glint,
+      scale: 10
+  });
+  
+  //Extrair a declividade (slope) para cada regressão
+  var slopeImage = ee.Dictionary({
+    'BlueC': linearFitBC.get('scale'),
+    'Green': linearFitG.get('scale'),
+    'Red': linearFitR.get('scale')
+  }).toImage();
+  
+  //Definir valor mínimo do NIR
+  var minNIR = img.select('NIR').reduceRegion(ee.Reducer.min(), roi) .toImage();
+  
+  //Fórmula deglint
+  return img.select(['BlueC', 'Green', 'Red'])
+        .subtract(slopeImage.multiply((img.select('NIR').subtract(minNIR))));
+  
+}
+
+//Aplicação da função deglint
+  var land_deglint = deglint(land)
+  Map.addLayer(land_deglint, {bands:['Red', 'Green', 'BlueC']})
+  
+//Mask land
+  var mask = land_deglint.gt(0);
+  var land_deglint_masked = land_deglint.updateMask(mask)
+  Map.addLayer(land_deglint_masked, {bands:['Red', 'Green', 'BlueC']})
+  
+ // Export.image.toDrive({
+   // image:land_deglint_masked,
+    //description: 'img_fn_20',
+    //scale: 30, 
+    //maxPixels:1e13
+ // })
+// Exportação
+Export.image.toDrive({
+    image: land_deglint_masked.select(['BlueC', 'Green', 'Red']).float(),
+    description: 'img_fn_20_glint',
+    scale: 30, 
+    region: roi, 
+    maxPixels: 1e13,
+    fileFormat: 'GeoTIFF'
+});
+// ====================================================================
+// 4. PREPARAÇÃO DOS DADOS DE TREINAMENTO
+// ====================================================================
+
+// 1. Variável da imagem final corrigida e deglintada (4 bandas)
+var classifiedImage = land_deglint_masked;
+
+// 2. Bandas preditoras que serão usadas no modelo
+var bands = ['BlueC', 'Green', 'Red'];
+
+// 3. Propriedade que contém os rótulos de treinamento (Class IDs)
+//var label = 'class';
+var send_geom = ee.Feature(send.geometry(), {class: 0});
+var subs_con_geom = ee.Feature(subs_con.geometry(), {class: 1});
+// --- Passo 2B: Unir em uma Feature Collection única ---
+
+var training_data = ee.FeatureCollection([
+    send_geom, 
+    subs_con_geom
+    // Adicione aqui todas as outras variáveis (agua1, agua2, floresta1, etc.)
+]);
+
+print('Training Data Collection', training_data.limit(2));
+
+// 4. Extrair os valores dos pixels (amostrar a imagem) para cada ponto/polígono de treinamento.
+// 'training_data' DEVE SER UMA VARIÁVEL DE GEOMETRIA FeatureCollection que você desenhou!
+var label = 'class';
+var training = classifiedImage.select(bands).sampleRegions({
+  collection: training_data,  // <-- Substitua se sua variável de treinamento tiver outro nome
+  properties: [label],
+  scale: 30 // Resolução do Landsat
+});
+// ====================================================================
+// 5. TREINAMENTO E CLASSIFICAÇÃO (RANDOM FOREST)
+// ====================================================================
+
+// 1. Configuração do Classificador Random Forest
+// Exemplo: 50 árvores (trees) para um bom balanço entre velocidade e precisão.
+var classifier = ee.Classifier.smileRandomForest({
+  numberOfTrees: 50,
+  seed: 0 // Para resultados reproduzíveis
+}).train({
+  features: training,
+  classProperty: label,
+  inputProperties: bands
+});
+
+// 2. Classificar a Imagem
+var classified = classifiedImage.select(bands).classify(classifier);
+
+// --------------------------------------------------------------------
+// 6. VISUALIZAÇÃO DOS RESULTADOS
+// --------------------------------------------------------------------
+
+// Defina as cores para a visualização
+// ATENÇÃO: Os valores e cores devem corresponder à sua propriedade 'class' (0, 1, 2, 3...)
+var vis_palette = ['#3aff45',
+                  '#71c27d',// 0: send
+                 
+                   ];
+
+Map.addLayer(classified, {min: 0, max: 3, palette: vis_palette}, '4. Classificação Random Forest');
+
+// Centraliza o mapa na área de estudo
+Map.centerObject(roi, 10);
+
+// ====================================================================
+// 7. AVALIAÇÃO DA PRECISÃO DO CLASSIFICADOR
+// ====================================================================
+
+// 1. Amostrar dados para validação (usaremos os mesmos dados de treinamento)
+// NOTA: Para uma avaliação mais rigorosa (menos otimista), use um FeatureCollection 
+// de validação SEPARADO (dados que o modelo nunca viu).
+var validation = classifiedImage.select(bands).sampleRegions({
+  collection: training_data, 
+  properties: [label], // 'class'
+  scale: 30
+});
+
+// 2. Classificar as amostras de validação (o modelo prediz as classes)
+var validated = validation.classify(classifier);
+
+// 3. Obter a Matriz de Confusão: compara a classe real ('class') com a classe predita ('classification')
+var confusionMatrix = validated.errorMatrix(label, 'classification');
+
+// Imprimir os resultados no Console:
+print('--- RESULTADOS DA MATRIZ DE CONFUSÃO ---');
+print('Matriz de Confusão (Linhas: Real, Colunas: Predita):', confusionMatrix);
+print('-----------------------------------------');
+print('Acurácia Total (Overall Accuracy):', confusionMatrix.accuracy());
+print('Acurácia do Kappa:', confusionMatrix.kappa());
+
+// Opcional: Acurácia do Produtor (Producer\'s Accuracy) e Consumidor (User\'s Accuracy)
+print('Acurácia do Produtor (Precisão por Classe - Omissão):', confusionMatrix.producersAccuracy());
+print('Acurácia do Consumidor (Precisão por Classe - Comissão):', confusionMatrix.consumersAccuracy());
+
+// ====================================================================
+// 8. CÁLCULO DA ÁREA DAS CLASSES EM KM²
+// ====================================================================
+
+// A imagem classificada (variável 'classified') já está pronta
+var classified = classifiedImage.select(bands).classify(classifier);
+
+// 1. Criar uma imagem onde o valor de cada pixel é a sua área em metros quadrados.
+var areaImage = ee.Image.pixelArea();
+
+// 2. Definir as classes e seus IDs (Certifique-se de que estes correspondem aos seus dados!)
+var classNames = ['send', 'subs_con']; 
+var classIds = [0, 1]; 
+
+// 3. Função para calcular a área para cada classe
+var area_results = ee.FeatureCollection(classIds.map(function(classId) {
+  // 3a. Cria uma máscara binária para a classe atual (1 onde é a classe, 0 no restante).
+  var classMask = classified.eq(classId);
+  
+  // 3b. Mascara a imagem de área para incluir apenas os pixels da classe.
+  var classArea = areaImage.updateMask(classMask);
+  
+  // 3c. Reduz (soma) a área em m² dentro da região de interesse (roi).
+  var stats = classArea.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: roi, // Sua área de estudo
+    scale: 30,      // Resolução do Landsat
+    maxPixels: 1e13
+  });
+  
+  // 3d. Obtém a área total em m² do resultado.
+  var area_m2 = ee.Number(stats.get('area')); 
+  
+  // 3e. Converte para km² (dividindo por 1,000,000) e armazena em uma Feature.
+  var area_km2 = area_m2.divide(1e6);
+  
+  // !!! CORREÇÃO AQUI: Formatar o número como String para exibição clara no Console !!!
+  // Formata o número para duas casas decimais.
+  var area_km2_string = area_km2.format('%.2f');
+  
+  // Retorna uma Feature com o valor de área em String (exibível).
+  return ee.Feature(null, {
+    'Classe': classNames[classId],
+    'Área (km²)': area_km2_string // Agora é uma String, não um Float
+  });
+}));
+
+// 4. Imprimir os resultados finais no Console:
+print('--- QUANTIFICAÇÃO FINAL DE ÁREA POR CLASSE (km²) ---');
+print(area_results);
+
+// ====================================================================
+// EXPORTAÇÃO DA IMAGEM CLASSIFICADA (GEOTIFF)
+// ====================================================================
+
+// A variável 'classified' é a imagem com os IDs das classes (0, 1, 2, 3...)
+var classified = classifiedImage.select(bands).classify(classifier);
+
+Export.image.toDrive({
+  image: classified.toInt(), // É crucial exportar o mapa de classes como INTEIRO
+  description: 'Classificacao_RandomForest_Area',
+  folder: 'GEE_Exports',     // Opcional: Especifique uma pasta no seu Drive
+  fileNamePrefix: 'class_map',
+  region: roi,              // A região de recorte da sua área de interesse
+  scale: 30,                // Resolução de 30 metros
+  crs: 'EPSG:4326',         // Opcional: Sistema de Coordenadas (WGS 84)
+  maxPixels: 1e13
+});
+
+
+// ====================================================================
+// EXPORTAÇÃO DA ÁREA CLASSIFICADA COMO VETOR (POLÍGONO) - OPCIONAL DE DEBUG
+// (Usar apenas se o Reducer.mode() falhar)
+// ====================================================================
+
+// A imagem classificada (Variável 'classified')
+var classified = classifiedImage.select(bands).classify(classifier);
+
+// 1. Otimização e Garantia de Banda Única:
+var classified_smoothed = classified.focal_mode(3).rename('classification').toInt();
+
+
+// ====================================================================
+// EXPORTAÇÃO DA CLASSE 0 (send) COMO VETOR (POLÍGONO)
+// ====================================================================
+
+// A imagem classificada (Variável 'classified')
+var classified = classifiedImage.select(bands).classify(classifier);
+
+// 1. ISOLAMENTO DA CLASSE 0 (send)
+// Cria uma imagem binária: 1 onde a classe é 0, 0 no restante.
+var send_only = classified.eq(0).rename('send_mask').toInt();
+
+// 2. Otimização e Garantia de Banda Única:
+// Suaviza a máscara de água (importante para polígonos limpos)
+var send_smoothed = send_only.focal_mode(3).rename('classification').toInt();
+
+
+// ---------------------------------------------------------------------------------------
+// Vetorização (Mantendo o truque de duas bandas que funcionou)
+// ---------------------------------------------------------------------------------------
+
+// 1. Criar uma banda falsa (dummy) preenchida com 1s.
+var dummy_band = send_smoothed.multiply(0).add(1).rename('dummy');
+
+// 2. Criar uma imagem de 2 bandas.
+var image_2bands = send_smoothed.addBands(dummy_band);
+
+// 3. Vetorização: Convertendo a imagem de 2 bandas para polígonos
+var vectors = image_2bands.reduceToVectors({
+  geometry: roi,                     
+  reducer: ee.Reducer.first(),       // Reducer.first() usado com sucesso em 2 bandas
+  scale: 30,                         
+  geometryType: 'polygon',           
+  // CRUCIAL: 'classification' agora armazena o valor 1 (pixel de água).
+  labelProperty: 'classification',   
+  maxPixels: 1e13
+});
+// ---------------------------------------------------------------------------------------
+
+
+// Opcional: Adicionar a camada vetorial ao mapa para visualização de debug
+Map.addLayer(vectors, {color: '0000FF'}, 'Vetorização - Classe Sedimentos');
+
+// 4. Exportação: Baixar os polígonos (Shapefile)
+Export.table.toDrive({
+  collection: vectors,
+  description: 'Poligonos_Classe_se',
+  folder: 'GEE_Exports',
+  fileNamePrefix: 'send_polygons_final',
+  fileFormat: 'SHP', 
+});
